@@ -1,7 +1,9 @@
 import os
+import hmac
+import hashlib
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 import requests
 
 app = FastAPI()
@@ -18,6 +20,18 @@ app.add_middleware(
 class SubscribeRequest(BaseModel):
     email: EmailStr
     source: str | None = None
+
+
+class CreateUPIOrderRequest(BaseModel):
+    amount_inr: int = Field(..., ge=1, description="Amount in INR paise (e.g., 49900 for ₹499.00)")
+    receipt: str | None = Field(None, description="Optional receipt identifier")
+    notes: dict | None = Field(default_factory=dict)
+
+
+class VerifyRazorpaySignatureRequest(BaseModel):
+    order_id: str
+    payment_id: str
+    signature: str
 
 
 @app.get("/")
@@ -112,6 +126,75 @@ def subscribe(payload: SubscribeRequest):
         raise HTTPException(status_code=504, detail="Beehiiv timeout")
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"Beehiiv error: {str(e)}")
+
+
+# ------------------------------
+# Payments: Razorpay UPI Checkout
+# ------------------------------
+@app.post("/payments/upi/create-order")
+def create_upi_order(payload: CreateUPIOrderRequest):
+    """
+    Create a Razorpay order for UPI checkout.
+
+    Required env vars:
+    - RAZORPAY_KEY_ID
+    - RAZORPAY_KEY_SECRET
+
+    Amount is in paise (e.g., 49900 = ₹499.00)
+    """
+    key_id = os.getenv("RAZORPAY_KEY_ID")
+    key_secret = os.getenv("RAZORPAY_KEY_SECRET")
+    if not key_id or not key_secret:
+        raise HTTPException(status_code=500, detail="Razorpay not configured on server")
+
+    url = "https://api.razorpay.com/v1/orders"
+    auth = (key_id, key_secret)
+    data = {
+        "amount": payload.amount_inr,  # in paise
+        "currency": "INR",
+        "receipt": payload.receipt or "rcpt_" + str(payload.amount_inr),
+        "payment_capture": 1,
+        "notes": payload.notes or {},
+    }
+
+    try:
+        r = requests.post(url, auth=auth, json=data, timeout=10)
+        r.raise_for_status()
+        order = r.json()
+        return {
+            "order_id": order.get("id"),
+            "amount": order.get("amount"),
+            "currency": order.get("currency"),
+            "key_id": key_id,
+        }
+    except requests.Timeout:
+        raise HTTPException(status_code=504, detail="Razorpay timeout")
+    except requests.HTTPError:
+        try:
+            err = r.json()
+        except Exception:
+            err = {"message": r.text}
+        raise HTTPException(status_code=r.status_code, detail=err)
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Razorpay error: {str(e)}")
+
+
+@app.post("/payments/razorpay/verify-signature")
+def verify_razorpay_signature(payload: VerifyRazorpaySignatureRequest):
+    """Verify Razorpay checkout signature after payment success."""
+    key_secret = os.getenv("RAZORPAY_KEY_SECRET")
+    if not key_secret:
+        raise HTTPException(status_code=500, detail="Razorpay not configured on server")
+
+    generated = hmac.new(
+        key_secret.encode("utf-8"),
+        f"{payload.order_id}|{payload.payment_id}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    if hmac.compare_digest(generated, payload.signature):
+        return {"valid": True}
+    raise HTTPException(status_code=400, detail={"valid": False})
 
 
 if __name__ == "__main__":
